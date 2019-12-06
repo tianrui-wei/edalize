@@ -74,13 +74,22 @@ quit
                         {'name' : 'speed',
                          'type' : 'String',
                          'desc' : 'FPGA speed grade (e.g. -2)'},
+                        {'name' : 'synth',
+                         'type' : 'String',
+                         'desc' : 'Synthesis tool. xst or yosys (default xst)'},
+                        {'name' : 'yosys_synth_options',
+                         'type' : 'String',
+                         'desc' : 'Additional options for the synth_xilinx command'},
                     ]}
 
     def configure_main(self):
         for i in ['family', 'device', 'package', 'speed']:
             if not i in self.tool_options:
                 raise RuntimeError("Missing required option '{}'".format(i))
-        self._write_tcl_file()
+        synth = self.tool_options.get('synth', 'xst')
+        if not synth in ['yosys', 'xst']:
+            raise RuntimeError("Invalid synth option '{}'. Valid values are 'yosys' or 'xst'".format(synth))
+        self._write_tcl_file(synth)
         with open(os.path.join(self.work_root, 'Makefile'),'w') as f:
             f.write(self.MAKEFILE_TEMPLATE)
         with open(os.path.join(self.work_root, 'config.mk'),'w') as f:
@@ -89,7 +98,43 @@ quit
         with open(os.path.join(self.work_root, self.name+'_run.tcl'),'w') as f:
             f.write(self.TCL_RUN_FILE_TEMPLATE)
 
-    def _write_tcl_file(self):
+    def _write_ys_file(self):
+        # Write yosys script file
+        (src_files, incdirs) = self._get_fileset_files()
+        with open(os.path.join(self.work_root, self.name+'.ys'), 'w') as yosys_file:
+            for key, value in self.vlogdefine.items():
+                yosys_file.write("verilog_defines -D{}={}\n".format(key, self._param_value_str(value)))
+
+            yosys_file.write("verilog_defaults -push\n")
+            yosys_file.write("verilog_defaults -add -defer\n")
+            if incdirs:
+                yosys_file.write("verilog_defaults -add {}\n".format(' '.join(['-I'+d for d in incdirs])))
+
+            pcf_files = []
+            for f in src_files:
+                if f.file_type in ['verilogSource']:
+                    yosys_file.write("read_verilog {}\n".format(f.name))
+                if f.file_type in ['systemVerilogSource']:
+                    yosys_file.write("read_verilog -sv {}\n".format(f.name))
+                elif f.file_type == 'user':
+                    pass
+            for key, value in self.vlogparam.items():
+                _s = "chparam -set {} {} $abstract\{}\n"
+                yosys_file.write(_s.format(key,
+                                           self._param_value_str(value, '"'),
+                                           self.toplevel))
+
+            yosys_file.write("verilog_defaults -pop\n")
+            yosys_file.write("synth_xilinx")
+            yosys_synth_options = self.tool_options.get('yosys_synth_options', [])
+            for option in yosys_synth_options:
+                yosys_file.write(' ' + option)
+            if self.toplevel:
+                yosys_file.write(" -family {} -ise -top {}".format(self.tool_options['device'][0:4],self.toplevel))
+            yosys_file.write("\n")
+            yosys_file.write("write_edif -pvector bra {}.edif\n".format(self.name))
+
+    def _write_tcl_file(self, synth):
         tcl_file = open(os.path.join(self.work_root, self.name+'.tcl'),'w')
 
         tcl_file.write(self.TCL_FILE_TEMPLATE.format(
@@ -98,6 +143,24 @@ quit
             device               = self.tool_options['device'],
             package              = self.tool_options['package'],
             speed                = self.tool_options['speed']))
+
+        (src_files, incdirs) = self._get_fileset_files()
+
+        if synth == 'yosys':
+            self._write_ys_file()
+            s = 'project set top_level_module_type "EDIF"\n'
+            s += 'xfile add "{}.edif"\n'.format(self.name)
+            tcl_file.write(s)
+            for f in src_files:
+                if f.file_type == 'tclSource':
+                    tcl_file.write('source {}\n'.format(f.name))
+                elif f.file_type == 'UCF':
+                    tcl_file.write('xfile_add_exist_ok {}\n'.format(f.name))
+                elif f.file_type == 'user':
+                    pass
+            tcl_file.write('project set top "{}"\n'.format(self.toplevel))
+            tcl_file.close()
+            return
 
         if self.vlogdefine:
             s = 'project set "Verilog Macros" "{}" -process "Synthesize - XST"\n'
@@ -108,8 +171,6 @@ quit
             genparam.update(self.generic)
             s = 'project set "Generics, Parameters" "{}" -process "Synthesize - XST"\n'
             tcl_file.write(s.format('|'.join([k+'='+self._param_value_str(v, '\\"') for k,v in genparam.items()])))
-
-        (src_files, incdirs) = self._get_fileset_files()
 
         if incdirs:
             tcl_file.write('project set "Verilog Include Directories" "{}" -process "Synthesize - XST"\n'.format('|'.join(incdirs)))
